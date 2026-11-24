@@ -450,6 +450,23 @@ class SlotErrorBoundary extends Component<
     children: ReactNode
   }, { failed: boolean }
 > {
+  /**
+   * Retry budget: one transient crash should not abdicate the slot. React's
+   * error boundaries catch render-time throwables; many upstream crashes are
+   * single-attempt races (an inject factory's async dep not yet settled, a
+   * provider mounting slightly behind its consumer). Giving the entry one
+   * silent retry clears the transient case without abdicating the slot —
+   * matches the ledger's supervision semantics where `abdicate: true` means
+   * "this entry is genuinely dead", not "this entry sneezed once".
+   *
+   * Budget = 1 retry: cheap enough to never loop forever, strong enough to
+   * absorb the common transient case. After MAX_ATTEMPTS the entry reports
+   * through `onEntryError` exactly as before (abdication, fallthrough to the
+   * next survivor, or the outlet's crash face).
+   */
+  private static readonly MAX_ATTEMPTS = 1
+  private attempts = 0
+
   override state = { failed: false }
   static getDerivedStateFromError(error: unknown): { failed: boolean } {
     if (error instanceof SlotAssemblyError || error instanceof HocContentError) throw error
@@ -457,6 +474,14 @@ class SlotErrorBoundary extends Component<
   }
   override componentDidCatch(error: unknown): void {
     console.error(`slot entry crashed in '${this.props.slotKey}':`, error)
+    this.attempts += 1
+    if (this.attempts <= SlotErrorBoundary.MAX_ATTEMPTS) {
+      // Transient retry: clear `failed` so the next render re-tries children
+      // instead of committing to the crash face. `onEntryError` is NOT called —
+      // the ledger only hears about crashes that survive the retry budget.
+      this.setState({ failed: false })
+      return
+    }
     this.props.onEntryError(error)
   }
   override render(): ReactNode {
